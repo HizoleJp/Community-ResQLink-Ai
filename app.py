@@ -24,6 +24,14 @@ from psycopg.rows import dict_row
 
 DB_PATH = Path(__file__).with_name("resqlink.db")
 load_dotenv(Path(__file__).with_name(".env"))
+
+import io
+import cloudinary
+import cloudinary.uploader
+from fastapi.concurrency import run_in_threadpool
+
+cloudinary.config(secure=True)
+
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 MYSQL_ENABLED = DATABASE_URL.startswith(("mysql://", "mysql+pymysql://"))
 PG_ENABLED = DATABASE_URL.startswith(("postgres://", "postgresql://"))
@@ -116,6 +124,23 @@ class EmergencyContactPayload(BaseModel):
 
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+def upload_photo(content: bytes) -> dict:
+    try:
+        result = cloudinary.uploader.upload(
+            io.BytesIO(content), folder="resqlink/reports", resource_type="image"
+        )
+    except Exception:
+        raise HTTPException(502, "Photo upload failed. Please try again.")
+    return {"url": result["secure_url"], "public_id": result["public_id"]}
+
+def delete_photo(public_id):
+    if not public_id:
+        return
+    try:
+        cloudinary.uploader.destroy(public_id)
+    except Exception:
+        pass
 
 def db():
     con = sqlite3.connect(DB_PATH)
@@ -795,6 +820,7 @@ async def create_report(
     image: Optional[UploadFile] = File(default=None),
 ):
     photo_url = None
+    public_id = None
     if image is not None:
         extension = ALLOWED_IMAGE_TYPES.get(image.content_type or "")
         if extension is None:
@@ -802,9 +828,9 @@ async def create_report(
         content = await image.read(MAX_UPLOAD_BYTES + 1)
         if len(content) > MAX_UPLOAD_BYTES:
             raise HTTPException(413, "The photo must be 8 MB or smaller.")
-        filename = f"{uuid4().hex}{extension}"
-        (UPLOAD_DIR / filename).write_bytes(content)
-        photo_url = f"/uploads/{filename}"
+        uploaded = await run_in_threadpool(upload_photo, content)
+        photo_url = uploaded["url"]
+        public_id = uploaded["public_id"]
 
     try:
         with pg_db() as con:
@@ -815,8 +841,7 @@ async def create_report(
                 (user_id, normalize_hazard_type(type), description.strip(), lat, lng, photo_url),
             ).fetchone()
     except Exception:
-        if photo_url:
-            (UPLOAD_DIR / Path(photo_url).name).unlink(missing_ok=True)
+        delete_photo(public_id)
         raise
 
     log_event(f"Incident report with photo submitted: {type.strip()}" if photo_url else f"Incident report submitted: {type.strip()}")
@@ -825,6 +850,7 @@ async def create_report(
 @app.post("/api/reports/json", status_code=201)
 def create_report_json(payload: ReportPayload):
     photo_url = None
+    public_id = None
     if payload.image_base64:
         mime_type = payload.image_mime or "image/jpeg"
         extension = ALLOWED_IMAGE_TYPES.get(mime_type)
@@ -838,9 +864,9 @@ def create_report_json(payload: ReportPayload):
             raise HTTPException(400, "The photo data is invalid.")
         if len(image_bytes) > MAX_UPLOAD_BYTES:
             raise HTTPException(413, "The photo must be 8 MB or smaller.")
-        filename = f"{uuid4().hex}{extension}"
-        (UPLOAD_DIR / filename).write_bytes(image_bytes)
-        photo_url = f"/uploads/{filename}"
+        uploaded = upload_photo(image_bytes)
+        photo_url = uploaded["url"]
+        public_id = uploaded["public_id"]
 
     try:
         with pg_db() as con:
@@ -851,8 +877,7 @@ def create_report_json(payload: ReportPayload):
                 (user_id, normalize_hazard_type(payload.type), payload.description.strip(), payload.lat, payload.lng, photo_url),
             ).fetchone()
     except Exception:
-        if photo_url:
-            (UPLOAD_DIR / Path(photo_url).name).unlink(missing_ok=True)
+        delete_photo(public_id)
         raise
 
     log_event(f"Incident report submitted: {payload.type.strip()}")
