@@ -457,59 +457,21 @@ def init_db():
             )
 
 def log_event(action: str):
-    if PG_ENABLED:
-        with pg_db() as con:
-            con.execute("INSERT INTO system_logs(action_taken) VALUES (%s)", (action[:255],))
-        return
-
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute(
-                    "INSERT INTO system_logs(action_taken) VALUES(%s)",
-                    (action[:255],),
-                )
-        return
-
-    with db() as con:
-        con.execute(
-            "INSERT INTO system_logs(action_taken,created_at) VALUES(?,?)",
-            (action[:255], now()),
-        )
+    with pg_db() as con:
+        con.execute("INSERT INTO system_logs(action_taken) VALUES (%s)", (action[:255],))
 
 def get_logs(limit: int = 100):
     safe_limit = max(1, min(limit, 200))
-    if PG_ENABLED:
-        with pg_db() as con:
-            rows = con.execute(
-                'SELECT log_id AS id, action_taken, "timestamp" AS created_at '
-                'FROM system_logs ORDER BY "timestamp" DESC LIMIT %s',
-                (safe_limit,),
-            ).fetchall()
-        return [
-            {"id": row["id"], "action": row["action_taken"], "time": row["created_at"].isoformat()}
-            for row in rows
-        ]
-
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute(
-                    "SELECT log_id AS id, action_taken, timestamp AS created_at FROM system_logs ORDER BY timestamp DESC LIMIT %s",
-                    (safe_limit,),
-                )
-                rows = cursor.fetchall()
-        return [{
-            "id": row["id"], "action": row["action_taken"],
-            "time": row["created_at"].isoformat() if hasattr(row["created_at"], "isoformat") else str(row["created_at"]),
-        } for row in rows]
-
-    with db() as con:
+    with pg_db() as con:
         rows = con.execute(
-            "SELECT id,action_taken,created_at FROM system_logs ORDER BY id DESC LIMIT ?",
+            'SELECT log_id AS id, action_taken, "timestamp" AS created_at '
+            'FROM system_logs ORDER BY "timestamp" DESC LIMIT %s',
             (safe_limit,),
         ).fetchall()
-    return [{"id": row["id"], "action": row["action_taken"], "time": row["created_at"]} for row in rows]
+    return [
+        {"id": row["id"], "action": row["action_taken"], "time": row["created_at"].isoformat()}
+        for row in rows
+    ]
 
 @app.on_event("startup")
 def startup():
