@@ -219,6 +219,7 @@ def normalize_hazard_type(value: str) -> str:
     normalized = value.strip().lower().replace(" ", "_").replace("-", "_")
     aliases = {
         "flooding": "flood",
+        "flood": "flood",
         "typhoon": "typhoon",
         "fire": "fire",
         "wildfire": "fire",
