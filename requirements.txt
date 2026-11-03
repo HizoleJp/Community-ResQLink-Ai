@@ -4,3 +4,4 @@ pydantic
 python-multipart
 pymysql
 python-dotenv
+psycopg[binary]

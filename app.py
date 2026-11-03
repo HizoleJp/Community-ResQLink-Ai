@@ -19,11 +19,14 @@ from pydantic import BaseModel, Field
 import pymysql
 from pymysql.cursors import DictCursor
 from dotenv import load_dotenv
+import psycopg
+from psycopg.rows import dict_row
 
 DB_PATH = Path(__file__).with_name("resqlink.db")
 load_dotenv(Path(__file__).with_name(".env"))
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 MYSQL_ENABLED = DATABASE_URL.startswith(("mysql://", "mysql+pymysql://"))
+PG_ENABLED = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 UPLOAD_DIR = Path(__file__).with_name("uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024
@@ -141,6 +144,12 @@ def mysql_db():
     finally:
         connection.close()
 
+@contextmanager
+def pg_db():
+    # Commits when the block ends normally, rolls back on error, always closes.
+    with psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=15) as connection:
+        yield connection
+
 def placeholders(query: str) -> str:
     return query.replace("?", "%s")
 
@@ -184,6 +193,23 @@ def token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 def seed_admin_accounts():
+    if PG_ENABLED:
+        with pg_db() as con:
+            for account in BOOTSTRAP_ADMIN_TOKENS:
+                if account["token"]:
+                    con.execute(
+                        """INSERT INTO admin_accounts (account_key, name, organization, token_hash)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (account_key) DO UPDATE SET token_hash = EXCLUDED.token_hash""",
+                        (
+                            account["account_key"],
+                            account["name"],
+                            account["organization"],
+                            token_hash(account["token"]),
+                        ),
+                    )
+        return
+
     if MYSQL_ENABLED:
         with mysql_db() as con:
             with con.cursor() as cursor:
@@ -261,6 +287,12 @@ def seed_admin_accounts():
                 )
 
 def init_db():
+    if PG_ENABLED:
+        with pg_db() as con:
+            con.execute("SELECT 1")
+        seed_admin_accounts()
+        return
+
     if MYSQL_ENABLED:
         with mysql_db() as con:
             with con.cursor() as cursor:
@@ -387,6 +419,11 @@ def init_db():
             )
 
 def log_event(action: str):
+    if PG_ENABLED:
+        with pg_db() as con:
+            con.execute("INSERT INTO system_logs(action_taken) VALUES (%s)", (action[:255],))
+        return
+
     if MYSQL_ENABLED:
         with mysql_db() as con:
             with con.cursor() as cursor:
@@ -404,6 +441,18 @@ def log_event(action: str):
 
 def get_logs(limit: int = 100):
     safe_limit = max(1, min(limit, 200))
+    if PG_ENABLED:
+        with pg_db() as con:
+            rows = con.execute(
+                'SELECT log_id AS id, action_taken, "timestamp" AS created_at '
+                'FROM system_logs ORDER BY "timestamp" DESC LIMIT %s',
+                (safe_limit,),
+            ).fetchall()
+        return [
+            {"id": row["id"], "action": row["action_taken"], "time": row["created_at"].isoformat()}
+            for row in rows
+        ]
+
     if MYSQL_ENABLED:
         with mysql_db() as con:
             with con.cursor() as cursor:
@@ -446,7 +495,13 @@ def require_admin(authorization: Optional[str]):
         }
 
     hashed_token = token_hash(token)
-    if MYSQL_ENABLED:
+    if PG_ENABLED:
+        with pg_db() as con:
+            account = con.execute(
+                "SELECT id,name,organization,organization_name,token_hash,active,deleted FROM admin_accounts WHERE token_hash=%s LIMIT 1",
+                (hashed_token,),
+            ).fetchone()
+    elif MYSQL_ENABLED:
         with mysql_db() as con:
             with con.cursor() as cursor:
                 cursor.execute(
@@ -664,7 +719,7 @@ def health():
         "ok": True,
         "service": "resqlink-python-api",
         "version": app.version,
-        "database": "mysql" if MYSQL_ENABLED else "sqlite",
+        "database": "postgres" if PG_ENABLED else ("mysql" if MYSQL_ENABLED else "sqlite"),
     }
 
 @app.get("/api/announcements")
