@@ -12,3 +12,11 @@ node_modules/
 .env.*
 !.env.example
 archives/
+
+.expo/
+dist/
+dist-android/
+.expo-export-check/
+export-log.txt
+
+resqlink_dump.sql
