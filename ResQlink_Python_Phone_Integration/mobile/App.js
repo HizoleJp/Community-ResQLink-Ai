@@ -21,7 +21,7 @@ import {
   View,
 } from 'react-native';
 
-const API_BASE = 'http://192.168.254.149:8001';
+const API_BASE = 'http://10.245.206.88:8001';
 const OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
 const PHOTON_URL = 'https://photon.komoot.io/api/';
 const OSRM_URL = 'https://router.project-osrm.org';
@@ -399,6 +399,7 @@ export default function App() {
   const [hotlineOpen, setHotlineOpen] = useState(false);
   const [localHotlines, setLocalHotlines] = useState([]);
   const [chatInput, setChatInput] = useState('');
+  const [chatThinking, setChatThinking] = useState(false);
   const [chatMessages, setChatMessages] = useState([
     { id: 1, from: 'bot', text: 'Hello! I am your AI Emergency Assistant. How can I assist you right now?' },
   ]);
@@ -940,24 +941,55 @@ export default function App() {
     }
   };
 
-  const sendChat = () => {
-    const value = chatInput.trim();
-    if (!value) {
-      return;
-    }
+  const askAssistant = async (text) => {
+   if (chatThinking) {
+     return;
+   }
+   const history = chatMessages.slice(-6).map((m) => ({
+     role: m.from === 'user' ? 'user' : 'bot',
+     text: m.text,
+   }));
+   setChatMessages((prev) => [...prev, { id: Date.now(), from: 'user', text }]);
+   setChatThinking(true);
 
-    const userMsg = { id: Date.now(), from: 'user', text: value };
-    const botMsg = { id: Date.now() + 1, from: 'bot', text: buildBotReply(value) };
+   let replyText;
+   try {
+     const data = await fetchJson(
+       `${API_BASE}/api/chat`,
+       {
+         method: 'POST',
+         headers: { 'Content-Type': 'application/json' },
+         body: JSON.stringify({
+           message: text,
+           history,
+           lat: location?.latitude ?? null,
+           lng: location?.longitude ?? null,
+           centers: evacuationCenters
+             .slice(0, 3)
+             .map((c) => c.description || c.type || 'Evacuation point'),
+         }),
+       },
+       20000,
+     );
+     replyText = data.reply;
+   } catch {
+     replyText = buildBotReply(text); // offline fallback
+   } finally {
+     setChatThinking(false);
+  }
+   setChatMessages((prev) => [...prev, { id: Date.now() + 1, from: 'bot', text: replyText }]);
+ };
 
-    setChatMessages((prev) => [...prev, userMsg, botMsg]);
-    setChatInput('');
-  };
+ const sendChat = () => {
+   const value = chatInput.trim();
+   if (!value) {
+     return;
+   }
+   setChatInput('');
+   askAssistant(value);
+};
 
-  const quickSend = (text) => {
-    const userMsg = { id: Date.now(), from: 'user', text };
-    const botMsg = { id: Date.now() + 1, from: 'bot', text: buildBotReply(text) };
-    setChatMessages((prev) => [...prev, userMsg, botMsg]);
-  };
+  const quickSend = (text) => askAssistant(text);
 
   const doLogin = () => {
     const email = 'guest@resqlink.app';
@@ -1319,7 +1351,8 @@ export default function App() {
             reports.map((report) => (
               <View key={String(report.id)} style={styles.recordCard}>
                 <View style={styles.recordHeader}>
-                  <Text style={styles.recordTitle}>{report.type}</Text>                  <Text style={[
+                  <Text
+ style={styles.recordTitle}>{report.type}</Text>                  <Text style={[
                     styles.recordStatus,
                     report.status === 'Community verified' ? styles.recordStatusVerified : styles.recordStatusPending,
                   ]}>{report.status || 'Saved'}</Text>
@@ -1640,6 +1673,11 @@ export default function App() {
                 <Text style={[styles.chatText, message.from === 'user' && styles.chatTextUser]}>{message.text}</Text>
               </View>
             ))}
+            {chatThinking && (
+                <View style={[styles.chatBubble, styles.botBubble]}>
+                  <Text style={styles.chatText}>Typing…</Text>
+                </View>
+              )}
           </ScrollView>
 
           <View style={styles.chatFooter}>

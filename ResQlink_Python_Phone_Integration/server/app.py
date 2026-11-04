@@ -12,18 +12,30 @@ from typing import Optional
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import pymysql
 from pymysql.cursors import DictCursor
 from dotenv import load_dotenv
+from gemini_chat import ask_gemini, rate_limited
+import psycopg
+from psycopg.rows import dict_row
 
 DB_PATH = Path(__file__).with_name("resqlink.db")
 load_dotenv(Path(__file__).with_name(".env"))
+
+import io
+import cloudinary
+import cloudinary.uploader
+from fastapi.concurrency import run_in_threadpool
+
+cloudinary.config(secure=True)
+
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 MYSQL_ENABLED = DATABASE_URL.startswith(("mysql://", "mysql+pymysql://"))
+PG_ENABLED = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 UPLOAD_DIR = Path(__file__).with_name("uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024
@@ -114,6 +126,23 @@ class EmergencyContactPayload(BaseModel):
 def now():
     return datetime.now(timezone.utc).isoformat()
 
+def upload_photo(content: bytes) -> dict:
+    try:
+        result = cloudinary.uploader.upload(
+            io.BytesIO(content), folder="resqlink/reports", resource_type="image"
+        )
+    except Exception:
+        raise HTTPException(502, "Photo upload failed. Please try again.")
+    return {"url": result["secure_url"], "public_id": result["public_id"]}
+
+def delete_photo(public_id):
+    if not public_id:
+        return
+    try:
+        cloudinary.uploader.destroy(public_id)
+    except Exception:
+        pass
+
 def db():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -140,6 +169,12 @@ def mysql_db():
         raise
     finally:
         connection.close()
+
+@contextmanager
+def pg_db():
+    # Commits when the block ends normally, rolls back on error, always closes.
+    with psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=15) as connection:
+        yield connection
 
 def placeholders(query: str) -> str:
     return query.replace("?", "%s")
@@ -168,10 +203,24 @@ def guest_user_id(connection) -> int:
         )
         return int(cursor.lastrowid)
 
+def pg_guest_user_id(con) -> int:
+    row = con.execute(
+        "SELECT user_id FROM users WHERE email=%s LIMIT 1", ("guest@example.com",)
+    ).fetchone()
+    if row:
+        return int(row["user_id"])
+    row = con.execute(
+        "INSERT INTO users(full_name,email,phone_number,password_hash,role) "
+        "VALUES(%s,%s,%s,%s,%s) RETURNING user_id",
+        ("ResQLink Guest", "guest@example.com", "0000000000", "not-for-login", "guest"),
+    ).fetchone()
+    return int(row["user_id"])
+
 def normalize_hazard_type(value: str) -> str:
     normalized = value.strip().lower().replace(" ", "_").replace("-", "_")
     aliases = {
         "flooding": "flood",
+        "flood": "flood",
         "typhoon": "typhoon",
         "fire": "fire",
         "wildfire": "fire",
@@ -184,6 +233,23 @@ def token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 def seed_admin_accounts():
+    if PG_ENABLED:
+        with pg_db() as con:
+            for account in BOOTSTRAP_ADMIN_TOKENS:
+                if account["token"]:
+                    con.execute(
+                        """INSERT INTO admin_accounts (account_key, name, organization, token_hash)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (account_key) DO UPDATE SET token_hash = EXCLUDED.token_hash""",
+                        (
+                            account["account_key"],
+                            account["name"],
+                            account["organization"],
+                            token_hash(account["token"]),
+                        ),
+                    )
+        return
+
     if MYSQL_ENABLED:
         with mysql_db() as con:
             with con.cursor() as cursor:
@@ -261,6 +327,12 @@ def seed_admin_accounts():
                 )
 
 def init_db():
+    if PG_ENABLED:
+        with pg_db() as con:
+            con.execute("SELECT 1")
+        seed_admin_accounts()
+        return
+
     if MYSQL_ENABLED:
         with mysql_db() as con:
             with con.cursor() as cursor:
@@ -387,42 +459,21 @@ def init_db():
             )
 
 def log_event(action: str):
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute(
-                    "INSERT INTO system_logs(action_taken) VALUES(%s)",
-                    (action[:255],),
-                )
-        return
-
-    with db() as con:
-        con.execute(
-            "INSERT INTO system_logs(action_taken,created_at) VALUES(?,?)",
-            (action[:255], now()),
-        )
+    with pg_db() as con:
+        con.execute("INSERT INTO system_logs(action_taken) VALUES (%s)", (action[:255],))
 
 def get_logs(limit: int = 100):
     safe_limit = max(1, min(limit, 200))
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute(
-                    "SELECT log_id AS id, action_taken, timestamp AS created_at FROM system_logs ORDER BY timestamp DESC LIMIT %s",
-                    (safe_limit,),
-                )
-                rows = cursor.fetchall()
-        return [{
-            "id": row["id"], "action": row["action_taken"],
-            "time": row["created_at"].isoformat() if hasattr(row["created_at"], "isoformat") else str(row["created_at"]),
-        } for row in rows]
-
-    with db() as con:
+    with pg_db() as con:
         rows = con.execute(
-            "SELECT id,action_taken,created_at FROM system_logs ORDER BY id DESC LIMIT ?",
+            'SELECT log_id AS id, action_taken, "timestamp" AS created_at '
+            'FROM system_logs ORDER BY "timestamp" DESC LIMIT %s',
             (safe_limit,),
         ).fetchall()
-    return [{"id": row["id"], "action": row["action_taken"], "time": row["created_at"]} for row in rows]
+    return [
+        {"id": row["id"], "action": row["action_taken"], "time": row["created_at"].isoformat()}
+        for row in rows
+    ]
 
 @app.on_event("startup")
 def startup():
@@ -446,7 +497,13 @@ def require_admin(authorization: Optional[str]):
         }
 
     hashed_token = token_hash(token)
-    if MYSQL_ENABLED:
+    if PG_ENABLED:
+        with pg_db() as con:
+            account = con.execute(
+                "SELECT id,name,organization,organization_name,token_hash,active,deleted FROM admin_accounts WHERE token_hash=%s LIMIT 1",
+                (hashed_token,),
+            ).fetchone()
+    elif MYSQL_ENABLED:
         with mysql_db() as con:
             with con.cursor() as cursor:
                 cursor.execute(
@@ -479,12 +536,11 @@ def require_super_admin(authorization: Optional[str]):
         raise HTTPException(403, "Only the super administrator can manage admin accounts.")
     return principal
 
-def report_scope(principal, latitude_column: str, longitude_column: str):
+def report_scope(principal, latitude_column: str = "latitude", longitude_column: str = "longitude"):
     if principal["organization"] == "cityhall_bacoor":
         min_lat, max_lat, min_lng, max_lng = BACOOR_BOUNDS
-        marker = "%s" if MYSQL_ENABLED else "?"
         return (
-            f"{latitude_column} BETWEEN {marker} AND {marker} AND {longitude_column} BETWEEN {marker} AND {marker}",
+            f"{latitude_column} BETWEEN %s AND %s AND {longitude_column} BETWEEN %s AND %s",
             (min_lat, max_lat, min_lng, max_lng),
         )
     return "1=1", ()
@@ -512,22 +568,21 @@ def admin_account_json(row):
         "created_at": row["created_at"],
     }
 
+ACCOUNT_COLUMNS = "id,name,organization,organization_name,active,created_at"
+
+def pg_admin_json(row):
+    item = admin_account_json(row)
+    item["created_at"] = str(row["created_at"])
+    return item
+
 @app.get("/api/admin/accounts")
 def list_admin_accounts(authorization: Optional[str] = Header(default=None)):
     require_super_admin(authorization)
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute(
-                    "SELECT id,name,organization,organization_name,active,created_at FROM admin_accounts WHERE deleted=0 ORDER BY id"
-                )
-                rows = cursor.fetchall()
-    else:
-        with db() as con:
-            rows = con.execute(
-                "SELECT id,name,organization,organization_name,active,created_at FROM admin_accounts WHERE deleted=0 ORDER BY id"
-            ).fetchall()
-    return {"items": [admin_account_json(row) for row in rows]}
+    with pg_db() as con:
+        rows = con.execute(
+            f"SELECT {ACCOUNT_COLUMNS} FROM admin_accounts WHERE deleted=FALSE ORDER BY id"
+        ).fetchall()
+    return {"items": [pg_admin_json(r) for r in rows]}
 
 @app.post("/api/admin/accounts", status_code=201)
 def create_admin_account(
@@ -544,36 +599,13 @@ def create_admin_account(
     organization_name = organization_name or None
     token = secrets.token_urlsafe(32)
     account_key = f"managed:{uuid4().hex}"
-    created_at = now()
-
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute(
-                    """INSERT INTO admin_accounts
-                    (account_key,name,organization,organization_name,token_hash,active,deleted,created_at)
-                    VALUES(%s,%s,%s,%s,%s,1,0,%s)""",
-                    (account_key, name, payload.organization, organization_name, token_hash(token), created_at),
-                )
-                account_id = cursor.lastrowid
-                cursor.execute(
-                    "SELECT id,name,organization,organization_name,active,created_at FROM admin_accounts WHERE id=%s",
-                    (account_id,),
-                )
-                row = cursor.fetchone()
-    else:
-        with db() as con:
-            cursor = con.execute(
-                """INSERT INTO admin_accounts
-                (account_key,name,organization,organization_name,token_hash,active,deleted,created_at)
-                VALUES(?,?,?,?,?,1,0,?)""",
-                (account_key, name, payload.organization, organization_name, token_hash(token), created_at),
-            )
-            row = con.execute(
-                "SELECT id,name,organization,organization_name,active,created_at FROM admin_accounts WHERE id=?",
-                (cursor.lastrowid,),
-            ).fetchone()
-    return {"account": admin_account_json(row), "token": token}
+    with pg_db() as con:
+        row = con.execute(
+            "INSERT INTO admin_accounts(account_key,name,organization,organization_name,token_hash) "
+            f"VALUES(%s,%s,%s,%s,%s) RETURNING {ACCOUNT_COLUMNS}",
+            (account_key, name, payload.organization, organization_name, token_hash(token)),
+        ).fetchone()
+    return {"account": pg_admin_json(row), "token": token}
 
 @app.patch("/api/admin/accounts/{account_id}")
 def update_admin_account(
@@ -582,44 +614,14 @@ def update_admin_account(
     authorization: Optional[str] = Header(default=None),
 ):
     require_super_admin(authorization)
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute(
-                    "UPDATE admin_accounts SET active=%s WHERE id=%s AND deleted=0",
-                    (int(payload.active), account_id),
-                )
-                if cursor.rowcount == 0:
-                    cursor.execute(
-                        "SELECT id FROM admin_accounts WHERE id=%s AND deleted=0",
-                        (account_id,),
-                    )
-                    if not cursor.fetchone():
-                        raise HTTPException(404, "Admin account not found.")
-                cursor.execute(
-                    "SELECT id,name,organization,organization_name,active,created_at FROM admin_accounts WHERE id=%s",
-                    (account_id,),
-                )
-                row = cursor.fetchone()
-    else:
-        with db() as con:
-            cursor = con.execute(
-                "UPDATE admin_accounts SET active=? WHERE id=? AND deleted=0",
-                (int(payload.active), account_id),
-            )
-            if cursor.rowcount == 0:
-                row = con.execute(
-                    "SELECT id,name,organization,organization_name,active,created_at FROM admin_accounts WHERE id=? AND deleted=0",
-                    (account_id,),
-                ).fetchone()
-                if not row:
-                    raise HTTPException(404, "Admin account not found.")
-            else:
-                row = con.execute(
-                    "SELECT id,name,organization,organization_name,active,created_at FROM admin_accounts WHERE id=?",
-                    (account_id,),
-                ).fetchone()
-    return {"account": admin_account_json(row)}
+    with pg_db() as con:
+        row = con.execute(
+            f"UPDATE admin_accounts SET active=%s WHERE id=%s AND deleted=FALSE RETURNING {ACCOUNT_COLUMNS}",
+            (payload.active, account_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Admin account not found.")
+    return {"account": pg_admin_json(row)}
 
 @app.delete("/api/admin/accounts/{account_id}")
 def delete_admin_account(
@@ -627,23 +629,13 @@ def delete_admin_account(
     authorization: Optional[str] = Header(default=None),
 ):
     require_super_admin(authorization)
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute(
-                    "UPDATE admin_accounts SET active=0,deleted=1 WHERE id=%s AND deleted=0",
-                    (account_id,),
-                )
-                if cursor.rowcount == 0:
-                    raise HTTPException(404, "Admin account not found.")
-    else:
-        with db() as con:
-            cursor = con.execute(
-                "UPDATE admin_accounts SET active=0,deleted=1 WHERE id=? AND deleted=0",
-                (account_id,),
-            )
-            if cursor.rowcount == 0:
-                raise HTTPException(404, "Admin account not found.")
+    with pg_db() as con:
+        cur = con.execute(
+            "UPDATE admin_accounts SET active=FALSE,deleted=TRUE WHERE id=%s AND deleted=FALSE",
+            (account_id,),
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Admin account not found.")
     return {"deleted": True, "id": account_id}
 
 def hazard_json(row):
@@ -664,35 +656,34 @@ def health():
         "ok": True,
         "service": "resqlink-python-api",
         "version": app.version,
-        "database": "mysql" if MYSQL_ENABLED else "sqlite",
+        "database": "postgres" if PG_ENABLED else ("mysql" if MYSQL_ENABLED else "sqlite"),
+    }
+
+def announcement_json(row):
+    return {
+        "id": row["alert_id"],
+        "title": row["title"],
+        "message": row["message"],
+        "level": row["alert_level"],
+        "audience": row["target_area"] or "all",
+        "created_at": str(row["created_at"]),
+    }
+
+def contact_json(row):
+    return {
+        "id": row["contact_id"],
+        "name": row["contact_name"],
+        "phone": row["contact_phone"],
+        "relationship": row["relationship"] or "Emergency contact",
     }
 
 @app.get("/api/announcements")
 def get_announcements():
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute("SELECT * FROM alerts_announcements ORDER BY created_at DESC LIMIT 20")
-                rows = cursor.fetchall()
-        return {"items": [{
-            "id": row["alert_id"],
-            "title": row["title"],
-            "message": row["message"],
-            "level": row["alert_level"],
-            "audience": row["target_area"] or "all",
-            "created_at": str(row["created_at"]),
-        } for row in rows]}
-
-    with db() as con:
-        rows = con.execute("SELECT * FROM announcements ORDER BY id DESC LIMIT 20").fetchall()
-    return {"items": [{
-        "id": row["id"],
-        "title": row["title"],
-        "message": row["message"],
-        "level": row["level"],
-        "audience": row["audience"],
-        "created_at": row["created_at"],
-    } for row in rows]}
+    with pg_db() as con:
+        rows = con.execute(
+            "SELECT * FROM alerts_announcements ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+    return {"items": [announcement_json(r) for r in rows]}
 
 @app.post("/api/announcements", status_code=201)
 def create_announcement(
@@ -700,88 +691,37 @@ def create_announcement(
     authorization: Optional[str] = Header(default=None),
 ):
     require_admin(authorization)
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            user_id = guest_user_id(con)
-            with con.cursor() as cursor:
-                cursor.execute(
-                    "INSERT INTO alerts_announcements(admin_id,title,message,target_area,alert_level) VALUES(%s,%s,%s,%s,%s)",
-                    (user_id, payload.title.strip(), payload.message.strip(), payload.audience.strip() or "all", payload.level.strip() or "info"),
-                )
-                cursor.execute("SELECT * FROM alerts_announcements WHERE alert_id=%s", (cursor.lastrowid,))
-                row = cursor.fetchone()
-        return {"item": {
-            "id": row["alert_id"],
-            "title": row["title"],
-            "message": row["message"],
-            "level": row["alert_level"],
-            "audience": row["target_area"] or "all",
-            "created_at": str(row["created_at"]),
-        }}
-
-    with db() as con:
-        cur = con.execute(
-            "INSERT INTO announcements(title,message,level,audience,created_at) VALUES(?,?,?,?,?)",
-            (payload.title.strip(), payload.message.strip(), payload.level.strip() or "info", payload.audience.strip() or "all", now()),
-        )
-        row = con.execute("SELECT * FROM announcements WHERE id=?", (cur.lastrowid,)).fetchone()
-    return {"item": {
-        "id": row["id"],
-        "title": row["title"],
-        "message": row["message"],
-        "level": row["level"],
-        "audience": row["audience"],
-        "created_at": row["created_at"],
-    }}
+    with pg_db() as con:
+        admin_id = pg_guest_user_id(con)
+        row = con.execute(
+            "INSERT INTO alerts_announcements(admin_id,title,message,target_area,alert_level) "
+            "VALUES(%s,%s,%s,%s,%s) RETURNING *",
+            (admin_id, payload.title.strip(), payload.message.strip(),
+             payload.audience.strip() or "all", payload.level.strip() or "info"),
+        ).fetchone()
+    return {"item": announcement_json(row)}
 
 @app.get("/api/user/profile")
 def get_user_profile():
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute("SELECT * FROM users WHERE email=%s LIMIT 1", ("guest@example.com",))
-                row = cursor.fetchone()
-        return {
-            "full_name": row["full_name"] if row else "Guest User",
-            "phone_number": row["phone_number"] if row else "09000000000",
-            "home_address": "Bacoor, Cavite",
-        }
-
-    with db() as con:
-        row = con.execute("SELECT * FROM user_profiles ORDER BY id DESC LIMIT 1").fetchone()
+    with pg_db() as con:
+        row = con.execute(
+            "SELECT full_name, phone_number FROM users WHERE email=%s LIMIT 1",
+            ("guest@example.com",),
+        ).fetchone()
     return {
         "full_name": row["full_name"] if row else "Guest User",
         "phone_number": row["phone_number"] if row else "09000000000",
-        "home_address": row["home_address"] if row else "Bacoor, Cavite",
+        "home_address": "Bacoor, Cavite",
     }
 
 @app.put("/api/user/profile")
 def update_user_profile(payload: UserProfilePayload):
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute(
-                    "UPDATE users SET full_name=%s, phone_number=%s WHERE email=%s",
-                    (payload.full_name.strip(), payload.phone_number or "09000000000", "guest@example.com"),
-                )
-        return {"ok": True, "profile": {
-            "full_name": payload.full_name.strip(),
-            "phone_number": payload.phone_number or "09000000000",
-            "home_address": payload.home_address or "Bacoor, Cavite",
-        }}
-
-    with db() as con:
-        existing = con.execute("SELECT * FROM user_profiles ORDER BY id DESC LIMIT 1").fetchone()
-        if existing:
-            con.execute(
-                "UPDATE user_profiles SET full_name=?, phone_number=?, home_address=?, created_at=? WHERE id=?",
-                (payload.full_name.strip(), payload.phone_number or "09000000000", payload.home_address or "Bacoor, Cavite", now(), existing["id"]),
-            )
-        else:
-            con.execute(
-                "INSERT INTO user_profiles(full_name,phone_number,home_address,created_at) VALUES(?,?,?,?)",
-                (payload.full_name.strip(), payload.phone_number or "09000000000", payload.home_address or "Bacoor, Cavite", now()),
-            )
+    with pg_db() as con:
+        pg_guest_user_id(con)  # makes sure the guest row exists
+        con.execute(
+            "UPDATE users SET full_name=%s, phone_number=%s WHERE email=%s",
+            (payload.full_name.strip(), payload.phone_number or "09000000000", "guest@example.com"),
+        )
     return {"ok": True, "profile": {
         "full_name": payload.full_name.strip(),
         "phone_number": payload.phone_number or "09000000000",
@@ -790,57 +730,23 @@ def update_user_profile(payload: UserProfilePayload):
 
 @app.get("/api/emergency-contacts")
 def get_emergency_contacts():
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute("SELECT * FROM emergency_contacts ORDER BY contact_id DESC LIMIT 10")
-                rows = cursor.fetchall()
-        return {"items": [{
-            "id": row["contact_id"],
-            "name": row["contact_name"],
-            "phone": row["contact_phone"],
-            "relationship": row["relationship"] or "Emergency contact",
-        } for row in rows]}
-
-    with db() as con:
-        rows = con.execute("SELECT * FROM emergency_contacts ORDER BY id DESC LIMIT 10").fetchall()
-    return {"items": [{
-        "id": row["id"],
-        "name": row["contact_name"],
-        "phone": row["contact_phone"],
-        "relationship": row["relationship"] or "Emergency contact",
-    } for row in rows]}
+    with pg_db() as con:
+        rows = con.execute(
+            "SELECT * FROM emergency_contacts ORDER BY contact_id DESC LIMIT 10"
+        ).fetchall()
+    return {"items": [contact_json(r) for r in rows]}
 
 @app.post("/api/emergency-contacts", status_code=201)
 def create_emergency_contact(payload: EmergencyContactPayload):
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute(
-                    "INSERT INTO emergency_contacts(contact_name,contact_phone,relationship) VALUES(%s,%s,%s)",
-                    (payload.contact_name.strip(), payload.contact_phone.strip(), payload.relationship.strip() if payload.relationship else "Emergency contact"),
-                )
-                cursor.execute("SELECT * FROM emergency_contacts WHERE contact_id=%s", (cursor.lastrowid,))
-                row = cursor.fetchone()
-        return {"item": {
-            "id": row["contact_id"],
-            "name": row["contact_name"],
-            "phone": row["contact_phone"],
-            "relationship": row["relationship"] or "Emergency contact",
-        }}
-
-    with db() as con:
-        cur = con.execute(
-            "INSERT INTO emergency_contacts(contact_name,contact_phone,relationship,created_at) VALUES(?,?,?,?)",
-            (payload.contact_name.strip(), payload.contact_phone.strip(), payload.relationship.strip() if payload.relationship else "Emergency contact", now()),
-        )
-        row = con.execute("SELECT * FROM emergency_contacts WHERE id=?", (cur.lastrowid,)).fetchone()
-    return {"item": {
-        "id": row["id"],
-        "name": row["contact_name"],
-        "phone": row["contact_phone"],
-        "relationship": row["relationship"] or "Emergency contact",
-    }}
+    with pg_db() as con:
+        user_id = pg_guest_user_id(con)
+        row = con.execute(
+            "INSERT INTO emergency_contacts(user_id,contact_name,contact_phone,relationship) "
+            "VALUES(%s,%s,%s,%s) RETURNING *",
+            (user_id, payload.contact_name.strip(), payload.contact_phone.strip(),
+             payload.relationship.strip() if payload.relationship else "Emergency contact"),
+        ).fetchone()
+    return {"item": contact_json(row)}
 
 @app.post("/api/sos/medical", status_code=201)
 def start_medical_sos(payload: SosCreate):
@@ -851,41 +757,23 @@ def start_medical_sos(payload: SosCreate):
 
 @app.get("/api/hazards")
 def get_hazards():
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute("SELECT * FROM disaster_reports ORDER BY created_at DESC LIMIT 100")
-                rows = cursor.fetchall()
-        return {"items": [mysql_report_json(row) for row in rows]}
-
-    with db() as con:
-        rows = con.execute("SELECT * FROM hazards ORDER BY id DESC LIMIT 100").fetchall()
-    return {"items": [hazard_json(r) for r in rows]}
+    with pg_db() as con:
+        rows = con.execute(
+            "SELECT * FROM disaster_reports ORDER BY created_at DESC LIMIT 100"
+        ).fetchall()
+    return {"items": [mysql_report_json(r) for r in rows]}
 
 @app.post("/api/hazards", status_code=201)
 def create_hazard(payload: HazardCreate):
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            user_id = guest_user_id(con)
-            with con.cursor() as cursor:
-                cursor.execute(
-                    "INSERT INTO disaster_reports(user_id,hazard_type,description,latitude,longitude,status,severity_level) VALUES(%s,%s,%s,%s,%s,'pending',3)",
-                    (user_id, normalize_hazard_type(payload.type), payload.description.strip(), payload.lat, payload.lng),
-                )
-                cursor.execute("SELECT * FROM disaster_reports WHERE report_id=%s", (cursor.lastrowid,))
-                row = cursor.fetchone()
-            log_event(f"Incident report submitted: {payload.type.strip()}")
-        return {"item": mysql_report_json(row)}
-
-    with db() as con:
-        cur = con.execute(
-            "INSERT INTO hazards(type,description,status,lat,lng,created_at) VALUES(?,?,?,?,?,?)",
-            (payload.type.strip(), payload.description.strip(),
-             "Pending verification", payload.lat, payload.lng, now())
-        )
-        row = con.execute("SELECT * FROM hazards WHERE id=?", (cur.lastrowid,)).fetchone()
+    with pg_db() as con:
+        user_id = pg_guest_user_id(con)
+        row = con.execute(
+            "INSERT INTO disaster_reports(user_id,hazard_type,description,latitude,longitude,status,severity_level) "
+            "VALUES(%s,%s,%s,%s,%s,'pending',3) RETURNING *",
+            (user_id, normalize_hazard_type(payload.type), payload.description.strip(), payload.lat, payload.lng),
+        ).fetchone()
     log_event(f"Incident report submitted: {payload.type.strip()}")
-    return {"item": hazard_json(row)}
+    return {"item": mysql_report_json(row)}
 
 @app.post("/api/reports", status_code=201)
 async def create_report(
@@ -896,6 +784,7 @@ async def create_report(
     image: Optional[UploadFile] = File(default=None),
 ):
     photo_url = None
+    public_id = None
     if image is not None:
         extension = ALLOWED_IMAGE_TYPES.get(image.content_type or "")
         if extension is None:
@@ -903,40 +792,29 @@ async def create_report(
         content = await image.read(MAX_UPLOAD_BYTES + 1)
         if len(content) > MAX_UPLOAD_BYTES:
             raise HTTPException(413, "The photo must be 8 MB or smaller.")
-        filename = f"{uuid4().hex}{extension}"
-        (UPLOAD_DIR / filename).write_bytes(content)
-        photo_url = f"/uploads/{filename}"
+        uploaded = await run_in_threadpool(upload_photo, content)
+        photo_url = uploaded["url"]
+        public_id = uploaded["public_id"]
 
-    if MYSQL_ENABLED:
-        try:
-            with mysql_db() as con:
-                user_id = guest_user_id(con)
-                with con.cursor() as cursor:
-                    cursor.execute(
-                        "INSERT INTO disaster_reports(user_id,hazard_type,description,latitude,longitude,image_url,status,severity_level) VALUES(%s,%s,%s,%s,%s,%s,'pending',3)",
-                        (user_id, normalize_hazard_type(type), description.strip(), lat, lng, photo_url),
-                    )
-                    cursor.execute("SELECT * FROM disaster_reports WHERE report_id=%s", (cursor.lastrowid,))
-                    row = cursor.fetchone()
-                    log_event(f"Incident report with photo submitted: {type.strip()}")
-            return {"item": mysql_report_json(row)}
-        except Exception:
-            if photo_url:
-                (UPLOAD_DIR / Path(photo_url).name).unlink(missing_ok=True)
-            raise
+    try:
+        with pg_db() as con:
+            user_id = pg_guest_user_id(con)
+            row = con.execute(
+                "INSERT INTO disaster_reports(user_id,hazard_type,description,latitude,longitude,image_url,status,severity_level) "
+                "VALUES(%s,%s,%s,%s,%s,%s,'pending',3) RETURNING *",
+                (user_id, normalize_hazard_type(type), description.strip(), lat, lng, photo_url),
+            ).fetchone()
+    except Exception:
+        delete_photo(public_id)
+        raise
 
-    with db() as con:
-        cur = con.execute(
-            "INSERT INTO hazards(type,description,status,lat,lng,created_at,photo_url) VALUES(?,?,?,?,?,?,?)",
-            (type.strip(), description.strip(), "Pending verification", lat, lng, now(), photo_url),
-        )
-        row = con.execute("SELECT * FROM hazards WHERE id=?", (cur.lastrowid,)).fetchone()
     log_event(f"Incident report with photo submitted: {type.strip()}" if photo_url else f"Incident report submitted: {type.strip()}")
-    return {"item": hazard_json(row)}
+    return {"item": mysql_report_json(row)}
 
 @app.post("/api/reports/json", status_code=201)
 def create_report_json(payload: ReportPayload):
     photo_url = None
+    public_id = None
     if payload.image_base64:
         mime_type = payload.image_mime or "image/jpeg"
         extension = ALLOWED_IMAGE_TYPES.get(mime_type)
@@ -950,100 +828,103 @@ def create_report_json(payload: ReportPayload):
             raise HTTPException(400, "The photo data is invalid.")
         if len(image_bytes) > MAX_UPLOAD_BYTES:
             raise HTTPException(413, "The photo must be 8 MB or smaller.")
-        filename = f"{uuid4().hex}{extension}"
-        (UPLOAD_DIR / filename).write_bytes(image_bytes)
-        photo_url = f"/uploads/{filename}"
+        uploaded = upload_photo(image_bytes)
+        photo_url = uploaded["url"]
+        public_id = uploaded["public_id"]
 
     try:
-        if MYSQL_ENABLED:
-            with mysql_db() as con:
-                user_id = guest_user_id(con)
-                with con.cursor() as cursor:
-                    cursor.execute(
-                        "INSERT INTO disaster_reports(user_id,hazard_type,description,latitude,longitude,image_url,status,severity_level) VALUES(%s,%s,%s,%s,%s,%s,'pending',3)",
-                        (user_id, normalize_hazard_type(payload.type), payload.description.strip(), payload.lat, payload.lng, photo_url),
-                    )
-                    cursor.execute("SELECT * FROM disaster_reports WHERE report_id=%s", (cursor.lastrowid,))
-                    row = cursor.fetchone()
-            result = mysql_report_json(row)
-        else:
-            with db() as con:
-                cur = con.execute(
-                    "INSERT INTO hazards(type,description,status,lat,lng,created_at,photo_url) VALUES(?,?,?,?,?,?,?)",
-                    (payload.type.strip(), payload.description.strip(), "Pending verification", payload.lat, payload.lng, now(), photo_url),
-                )
-                row = con.execute("SELECT * FROM hazards WHERE id=?", (cur.lastrowid,)).fetchone()
-            result = hazard_json(row)
+        with pg_db() as con:
+            user_id = pg_guest_user_id(con)
+            row = con.execute(
+                "INSERT INTO disaster_reports(user_id,hazard_type,description,latitude,longitude,image_url,status,severity_level) "
+                "VALUES(%s,%s,%s,%s,%s,%s,'pending',3) RETURNING *",
+                (user_id, normalize_hazard_type(payload.type), payload.description.strip(), payload.lat, payload.lng, photo_url),
+            ).fetchone()
     except Exception:
-        if photo_url:
-            (UPLOAD_DIR / Path(photo_url).name).unlink(missing_ok=True)
+        delete_photo(public_id)
         raise
 
     log_event(f"Incident report submitted: {payload.type.strip()}")
-    return {"item": result}
+    return {"item": mysql_report_json(row)}
 
 @app.get("/api/sos/status")
 def sos_status():
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute("SELECT * FROM sos_alerts WHERE status='active' ORDER BY created_at DESC LIMIT 1")
-                row = cursor.fetchone()
-        if not row:
-            return {"active": False, "item": None}
-        return {"active": True, "item": {
-            "id": row["sos_id"], "lat": float(row["latitude"]), "lng": float(row["longitude"]),
-            "label": "Current phone location", "active": True, "created_at": str(row["created_at"]),
-        }}
-
-    with db() as con:
+    with pg_db() as con:
         row = con.execute(
-            "SELECT * FROM sos_signals WHERE active=1 ORDER BY id DESC LIMIT 1"
+            "SELECT * FROM sos_alerts WHERE status='active' ORDER BY created_at DESC LIMIT 1"
         ).fetchone()
-    return {"active": row is not None, "item": dict(row) if row else None}
+    if not row:
+        return {"active": False, "item": None}
+    return {"active": True, "item": {
+        "id": row["sos_id"], "lat": float(row["latitude"]), "lng": float(row["longitude"]),
+        "label": "Current phone location", "active": True, "created_at": str(row["created_at"]),
+    }}
 
 @app.post("/api/sos", status_code=201)
 def start_sos(payload: SosCreate):
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            user_id = guest_user_id(con)
-            with con.cursor() as cursor:
-                cursor.execute("UPDATE sos_alerts SET status='resolved' WHERE status='active' AND user_id=%s", (user_id,))
-                cursor.execute(
-                    "INSERT INTO sos_alerts(user_id,latitude,longitude,status) VALUES(%s,%s,%s,'active')",
-                    (user_id, payload.lat, payload.lng),
-                )
-                sos_id = cursor.lastrowid
-            log_event("SOS started")
-        return {"active": True, "item": {
-            "id": sos_id, "lat": payload.lat, "lng": payload.lng,
-            "label": payload.label.strip(), "active": True,
-        }}
-
-    with db() as con:
-        con.execute("UPDATE sos_signals SET active=0 WHERE active=1")
-        cur = con.execute(
-            "INSERT INTO sos_signals(lat,lng,label,active,created_at) VALUES(?,?,?,?,?)",
-            (payload.lat, payload.lng, payload.label.strip(), 1, now())
+    with pg_db() as con:
+        user_id = pg_guest_user_id(con)
+        con.execute(
+            "UPDATE sos_alerts SET status='resolved' WHERE status='active' AND user_id=%s",
+            (user_id,),
         )
-        row = con.execute("SELECT * FROM sos_signals WHERE id=?", (cur.lastrowid,)).fetchone()
+        row = con.execute(
+            "INSERT INTO sos_alerts(user_id,latitude,longitude,status) "
+            "VALUES(%s,%s,%s,'active') RETURNING sos_id",
+            (user_id, payload.lat, payload.lng),
+        ).fetchone()
     log_event("SOS started")
-    return {"active": True, "item": dict(row)}
+    return {"active": True, "item": {
+        "id": row["sos_id"], "lat": payload.lat, "lng": payload.lng,
+        "label": payload.label.strip(), "active": True,
+    }}
 
 @app.delete("/api/sos")
 def stop_sos():
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            user_id = guest_user_id(con)
-            with con.cursor() as cursor:
-                cursor.execute("UPDATE sos_alerts SET status='resolved' WHERE status='active' AND user_id=%s", (user_id,))
-        log_event("SOS stopped")
-        return {"active": False}
-
-    with db() as con:
-        con.execute("UPDATE sos_signals SET active=0 WHERE active=1")
+    with pg_db() as con:
+        user_id = pg_guest_user_id(con)
+        con.execute(
+            "UPDATE sos_alerts SET status='resolved' WHERE status='active' AND user_id=%s",
+            (user_id,),
+        )
     log_event("SOS stopped")
     return {"active": False}
+
+class ChatTurn(BaseModel):
+    role: str = Field(pattern="^(user|bot)$")
+    text: str = Field(max_length=1000)
+
+class ChatPayload(BaseModel):
+    message: str = Field(min_length=1, max_length=500)
+    history: list[ChatTurn] = Field(default_factory=list, max_length=8)
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    centers: list[str] = Field(default_factory=list, max_length=5)
+
+@app.post("/api/chat")
+def chat(payload: ChatPayload, request: Request):
+    ip = request.client.host if request.client else "unknown"
+    if rate_limited(ip):
+       raise HTTPException(429, "Too many chat messages. Wait a minute and try again.")
+    try:
+        reply = ask_gemini(
+           payload.message,
+           [t.model_dump() for t in payload.history],
+               payload.lat,
+               payload.lng,
+               payload.centers,
+        )
+    except Exception:
+       raise HTTPException(503, "The AI assistant is unavailable right now.")
+    try:
+        with pg_db() as con:
+            con.execute(
+               "INSERT INTO chat_logs(user_query, bot_response) VALUES (%s, %s)",
+               (payload.message, reply),
+    )
+    except Exception:
+        pass  # logging must never break the chat
+    return {"reply": reply}
 
 @app.get("/api/logs")
 def list_system_logs(limit: int = 100):
@@ -1051,35 +932,28 @@ def list_system_logs(limit: int = 100):
 
 @app.get("/api/agencies")
 def get_agencies(type: Optional[str] = None, lat: Optional[float] = None, lng: Optional[float] = None):
-    if not MYSQL_ENABLED:
-        return {"items": []}
-
     query = "SELECT * FROM emergency_agencies"
     params = ()
     if type:
         query += " WHERE agency_type=%s"
         params = (type.strip().lower(),)
     query += " ORDER BY name LIMIT 100"
-    with mysql_db() as con:
-        with con.cursor() as cursor:
-            cursor.execute(query, params)
-            rows = cursor.fetchall()
+    with pg_db() as con:
+        rows = con.execute(query, params).fetchall()
 
     items = [{
-        "id": row["agency_id"], "type": row["agency_type"], "name": row["name"],
-        "address": row["address"], "hotline": row["hotline"],
-        "alternate_phone": row["alternate_phone"],
-        "lat": float(row["latitude"]) if row["latitude"] is not None else None,
-        "lng": float(row["longitude"]) if row["longitude"] is not None else None,
-    } for row in rows]
-    items = [item for item in items if item["lat"] is not None and item["lng"] is not None]
+        "id": r["agency_id"], "type": r["agency_type"], "name": r["name"],
+        "address": r["address"], "hotline": r["hotline"],
+        "alternate_phone": r["alternate_phone"],
+        "lat": r["latitude"], "lng": r["longitude"],
+    } for r in rows if r["latitude"] is not None and r["longitude"] is not None]
     if lat is not None and lng is not None:
         for item in items:
             item["distance_km"] = haversine_km(lat, lng, item["lat"], item["lng"])
         items.sort(key=lambda item: item["distance_km"])
     return {"items": items}
 
-def evacuation_center_json(row, mysql=False):
+def evacuation_center_json(row):
     return {
         "id": row["id"],
         "name": row["name"],
@@ -1087,7 +961,7 @@ def evacuation_center_json(row, mysql=False):
         "latitude": float(row["latitude"]),
         "longitude": float(row["longitude"]),
         "capacity": row["capacity"] or 0,
-        "occupancy": (row["current_occupancy"] if mysql else row["occupancy"]) or 0,
+        "occupancy": row["current_occupancy"] or 0,
         "status": row["status"],
     }
 
@@ -1098,6 +972,8 @@ def validate_center_payload(payload):
     if payload.occupancy > payload.capacity:
         raise HTTPException(422, "Occupancy cannot exceed the center's capacity.")
     return name, payload.address.strip() if payload.address else None
+
+CENTER_COLUMNS = "shelter_id AS id,name,address,latitude,longitude,capacity,current_occupancy,status"
 
 @app.get("/api/centers")
 def list_evacuation_centers(
@@ -1110,36 +986,18 @@ def list_evacuation_centers(
         raise HTTPException(422, "Page must be greater than zero.")
     search_term = f"%{search.strip()}%"
     offset = (page - 1) * 20
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute(
-                    "SELECT COUNT(*) AS total FROM shelters WHERE name LIKE %s OR COALESCE(address,'') LIKE %s",
-                    (search_term, search_term),
-                )
-                total = cursor.fetchone()["total"]
-                cursor.execute(
-                    """SELECT shelter_id AS id,name,address,latitude,longitude,capacity,
-                    current_occupancy,status FROM shelters
-                    WHERE name LIKE %s OR COALESCE(address,'') LIKE %s
-                    ORDER BY name LIMIT 20 OFFSET %s""",
-                    (search_term, search_term, offset),
-                )
-                rows = cursor.fetchall()
-        return {"rows": [evacuation_center_json(row, mysql=True) for row in rows], "total": total, "page": page}
-
-    with db() as con:
+    with pg_db() as con:
         total = con.execute(
-            "SELECT COUNT(*) FROM evacuation_centers WHERE name LIKE ? OR COALESCE(address,'') LIKE ?",
+            "SELECT COUNT(*) AS total FROM shelters WHERE name ILIKE %s OR COALESCE(address,'') ILIKE %s",
             (search_term, search_term),
-        ).fetchone()[0]
+        ).fetchone()["total"]
         rows = con.execute(
-            """SELECT id,name,address,latitude,longitude,capacity,occupancy,status
-            FROM evacuation_centers WHERE name LIKE ? OR COALESCE(address,'') LIKE ?
-            ORDER BY name LIMIT 20 OFFSET ?""",
+            f"SELECT {CENTER_COLUMNS} FROM shelters "
+            "WHERE name ILIKE %s OR COALESCE(address,'') ILIKE %s "
+            "ORDER BY name LIMIT 20 OFFSET %s",
             (search_term, search_term, offset),
         ).fetchall()
-    return {"rows": [evacuation_center_json(row) for row in rows], "total": total, "page": page}
+    return {"rows": [evacuation_center_json(r) for r in rows], "total": total, "page": page}
 
 @app.post("/api/centers", status_code=201)
 def create_evacuation_center(
@@ -1148,32 +1006,11 @@ def create_evacuation_center(
 ):
     require_admin(authorization)
     name, address = validate_center_payload(payload)
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute(
-                    """INSERT INTO shelters(name,address,latitude,longitude,capacity,current_occupancy,status)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s)""",
-                    (name, address, payload.latitude, payload.longitude, payload.capacity, payload.occupancy, payload.status),
-                )
-                cursor.execute(
-                    """SELECT shelter_id AS id,name,address,latitude,longitude,capacity,
-                    current_occupancy,status FROM shelters WHERE shelter_id=%s""",
-                    (cursor.lastrowid,),
-                )
-                row = cursor.fetchone()
-        return {"item": evacuation_center_json(row, mysql=True)}
-
-    with db() as con:
-        cursor = con.execute(
-            """INSERT INTO evacuation_centers(name,address,latitude,longitude,capacity,occupancy,status)
-            VALUES(?,?,?,?,?,?,?)""",
-            (name, address, payload.latitude, payload.longitude, payload.capacity, payload.occupancy, payload.status),
-        )
+    with pg_db() as con:
         row = con.execute(
-            """SELECT id,name,address,latitude,longitude,capacity,occupancy,status
-            FROM evacuation_centers WHERE id=?""",
-            (cursor.lastrowid,),
+            "INSERT INTO shelters(name,address,latitude,longitude,capacity,current_occupancy,status) "
+            f"VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING {CENTER_COLUMNS}",
+            (name, address, payload.latitude, payload.longitude, payload.capacity, payload.occupancy, payload.status),
         ).fetchone()
     return {"item": evacuation_center_json(row)}
 
@@ -1185,84 +1022,38 @@ def update_evacuation_center(
 ):
     require_admin(authorization)
     name, address = validate_center_payload(payload)
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute(
-                    """UPDATE shelters SET name=%s,address=%s,latitude=%s,longitude=%s,
-                    capacity=%s,current_occupancy=%s,status=%s WHERE shelter_id=%s""",
-                    (name, address, payload.latitude, payload.longitude, payload.capacity, payload.occupancy, payload.status, center_id),
-                )
-                cursor.execute(
-                    """SELECT shelter_id AS id,name,address,latitude,longitude,capacity,
-                    current_occupancy,status FROM shelters WHERE shelter_id=%s""",
-                    (center_id,),
-                )
-                row = cursor.fetchone()
-        if not row:
-            raise HTTPException(404, "Evacuation center not found.")
-        return {"item": evacuation_center_json(row, mysql=True)}
-
-    with db() as con:
-        cursor = con.execute(
-            """UPDATE evacuation_centers SET name=?,address=?,latitude=?,longitude=?,
-            capacity=?,occupancy=?,status=? WHERE id=?""",
-            (name, address, payload.latitude, payload.longitude, payload.capacity, payload.occupancy, payload.status, center_id),
-        )
-        if cursor.rowcount == 0:
-            raise HTTPException(404, "Evacuation center not found.")
+    with pg_db() as con:
         row = con.execute(
-            """SELECT id,name,address,latitude,longitude,capacity,occupancy,status
-            FROM evacuation_centers WHERE id=?""",
-            (center_id,),
+            "UPDATE shelters SET name=%s,address=%s,latitude=%s,longitude=%s,"
+            "capacity=%s,current_occupancy=%s,status=%s WHERE shelter_id=%s "
+            f"RETURNING {CENTER_COLUMNS}",
+            (name, address, payload.latitude, payload.longitude, payload.capacity, payload.occupancy, payload.status, center_id),
         ).fetchone()
+    if not row:
+        raise HTTPException(404, "Evacuation center not found.")
     return {"item": evacuation_center_json(row)}
 
 @app.delete("/api/centers/{center_id}")
 def delete_evacuation_center(center_id: int, authorization: Optional[str] = Header(default=None)):
     require_admin(authorization)
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute("DELETE FROM shelters WHERE shelter_id=%s", (center_id,))
-                if cursor.rowcount == 0:
-                    raise HTTPException(404, "Evacuation center not found.")
-        return {"deleted": True}
-
-    with db() as con:
-        cursor = con.execute("DELETE FROM evacuation_centers WHERE id=?", (center_id,))
-        if cursor.rowcount == 0:
+    with pg_db() as con:
+        cur = con.execute("DELETE FROM shelters WHERE shelter_id=%s", (center_id,))
+        if cur.rowcount == 0:
             raise HTTPException(404, "Evacuation center not found.")
     return {"deleted": True}
 
 @app.get("/api/shelters")
 def get_shelters(lat: Optional[float] = None, lng: Optional[float] = None):
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute(
-                    """SELECT shelter_id AS id,name,address,latitude,longitude,capacity,
-                    current_occupancy,status FROM shelters WHERE status='open' ORDER BY name LIMIT 100"""
-                )
-                rows = cursor.fetchall()
-        items = [{
-            "id": row["id"], "type": "Evacuation Center", "kind": "Evacuation Center",
-            "description": row["name"], "address": row["address"], "status": row["status"],
-            "lat": float(row["latitude"]), "lng": float(row["longitude"]),
-            "capacity": row["capacity"], "current_occupancy": row["current_occupancy"],
-        } for row in rows]
-    else:
-        with db() as con:
-            rows = con.execute(
-                """SELECT id,name,address,latitude,longitude,capacity,occupancy,status
-                FROM evacuation_centers WHERE status='open' ORDER BY name LIMIT 100"""
-            ).fetchall()
-        items = [{
-            "id": row["id"], "type": "Evacuation Center", "kind": "Evacuation Center",
-            "description": row["name"], "address": row["address"], "status": row["status"],
-            "lat": float(row["latitude"]), "lng": float(row["longitude"]),
-            "capacity": row["capacity"], "current_occupancy": row["occupancy"],
-        } for row in rows]
+    with pg_db() as con:
+        rows = con.execute(
+            f"SELECT {CENTER_COLUMNS} FROM shelters WHERE status='open' ORDER BY name LIMIT 100"
+        ).fetchall()
+    items = [{
+        "id": r["id"], "type": "Evacuation Center", "kind": "Evacuation Center",
+        "description": r["name"], "address": r["address"], "status": r["status"],
+        "lat": float(r["latitude"]), "lng": float(r["longitude"]),
+        "capacity": r["capacity"], "current_occupancy": r["current_occupancy"],
+    } for r in rows]
     if lat is not None and lng is not None:
         for item in items:
             item["distance_km"] = haversine_km(lat, lng, item["lat"], item["lng"])
@@ -1280,65 +1071,24 @@ def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
 @app.get("/api/admin/overview")
 def admin_overview(authorization: Optional[str] = Header(default=None)):
     principal = require_admin(authorization)
-    latitude_column = "latitude" if MYSQL_ENABLED else "lat"
-    longitude_column = "longitude" if MYSQL_ENABLED else "lng"
-    report_filter, report_params = report_scope(principal, latitude_column, longitude_column)
-    sos_filter, sos_params = report_scope(principal, latitude_column, longitude_column)
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute(
-                    f"SELECT COUNT(*) AS total FROM disaster_reports WHERE {report_filter}",
-                    report_params,
-                )
-                total = cursor.fetchone()["total"]
-                cursor.execute(
-                    f"SELECT COUNT(*) AS total FROM disaster_reports WHERE status='pending' AND {report_filter}",
-                    report_params,
-                )
-                pending = cursor.fetchone()["total"]
-                cursor.execute(
-                    f"SELECT COUNT(*) AS total FROM disaster_reports WHERE status='verified' AND {report_filter}",
-                    report_params,
-                )
-                verified = cursor.fetchone()["total"]
-                cursor.execute(
-                    f"SELECT * FROM sos_alerts WHERE status='active' AND {sos_filter} ORDER BY created_at DESC LIMIT 1",
-                    sos_params,
-                )
-                sos = cursor.fetchone()
-                cursor.execute(
-                    f"SELECT * FROM disaster_reports WHERE {report_filter} ORDER BY created_at DESC LIMIT 100",
-                    report_params,
-                )
-                rows = cursor.fetchall()
-        return {
-            "userAccess": "authenticated",
-            "principal": principal,
-            "stats": {"totalReports": total, "pendingReports": pending, "verifiedReports": verified, "activeSos": sos is not None},
-            "hazards": [mysql_report_json(row) for row in rows],
-            "activeSos": ({"id": sos["sos_id"], "lat": float(sos["latitude"]), "lng": float(sos["longitude"]), "active": True} if sos else None),
-        }
-
-    with db() as con:
+    scope, params = report_scope(principal)
+    with pg_db() as con:
         total = con.execute(
-            f"SELECT COUNT(*) FROM hazards WHERE {report_filter}", report_params
-        ).fetchone()[0]
+            f"SELECT COUNT(*) AS total FROM disaster_reports WHERE {scope}", params
+        ).fetchone()["total"]
         pending = con.execute(
-            f"SELECT COUNT(*) FROM hazards WHERE status='Pending verification' AND {report_filter}",
-            report_params,
-        ).fetchone()[0]
+            f"SELECT COUNT(*) AS total FROM disaster_reports WHERE status='pending' AND {scope}", params
+        ).fetchone()["total"]
         verified = con.execute(
-            f"SELECT COUNT(*) FROM hazards WHERE status='Community verified' AND {report_filter}",
-            report_params,
-        ).fetchone()[0]
+            f"SELECT COUNT(*) AS total FROM disaster_reports WHERE status='verified' AND {scope}", params
+        ).fetchone()["total"]
         sos = con.execute(
-            f"SELECT * FROM sos_signals WHERE active=1 AND {sos_filter} ORDER BY id DESC LIMIT 1",
-            sos_params,
+            f"SELECT * FROM sos_alerts WHERE status='active' AND {scope} ORDER BY created_at DESC LIMIT 1",
+            params,
         ).fetchone()
         rows = con.execute(
-            f"SELECT * FROM hazards WHERE {report_filter} ORDER BY id DESC LIMIT 100",
-            report_params,
+            f"SELECT * FROM disaster_reports WHERE {scope} ORDER BY created_at DESC LIMIT 100",
+            params,
         ).fetchall()
     return {
         "userAccess": "authenticated",
@@ -1349,90 +1099,50 @@ def admin_overview(authorization: Optional[str] = Header(default=None)):
             "verifiedReports": verified,
             "activeSos": sos is not None,
         },
-        "hazards": [hazard_json(r) for r in rows],
-        "activeSos": dict(sos) if sos else None,
+        "hazards": [mysql_report_json(row) for row in rows],
+        "activeSos": (
+            {"id": sos["sos_id"], "lat": float(sos["latitude"]), "lng": float(sos["longitude"]), "active": True}
+            if sos else None
+        ),
     }
 
 @app.put("/api/admin/hazards/{hazard_id}/verify")
 def verify_hazard(hazard_id: int, authorization: Optional[str] = Header(default=None)):
     principal = require_admin(authorization)
-    report_filter, report_params = report_scope(
-        principal,
-        "latitude" if MYSQL_ENABLED else "lat",
-        "longitude" if MYSQL_ENABLED else "lng",
-    )
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute(
-                    f"UPDATE disaster_reports SET status='verified' WHERE report_id=%s AND {report_filter}",
-                    (hazard_id, *report_params),
-                )
-                if cursor.rowcount == 0:
-                    raise HTTPException(404, "Incident report not found.")
-                cursor.execute("SELECT * FROM disaster_reports WHERE report_id=%s", (hazard_id,))
-                row = cursor.fetchone()
-        return {"item": mysql_report_json(row)}
-
-    with db() as con:
+    scope, params = report_scope(principal)
+    with pg_db() as con:
         cur = con.execute(
-            f"UPDATE hazards SET status='Community verified' WHERE id=? AND {report_filter}",
-            (hazard_id, *report_params),
+            f"UPDATE disaster_reports SET status='verified' WHERE report_id=%s AND {scope}",
+            (hazard_id, *params),
         )
         if cur.rowcount == 0:
-            raise HTTPException(404, "Hazard report not found.")
-        row = con.execute("SELECT * FROM hazards WHERE id=?", (hazard_id,)).fetchone()
-    return {"item": hazard_json(row)}
+            raise HTTPException(404, "Incident report not found.")
+        row = con.execute(
+            "SELECT * FROM disaster_reports WHERE report_id=%s", (hazard_id,)
+        ).fetchone()
+    return {"item": mysql_report_json(row)}
 
 @app.delete("/api/admin/hazards/{hazard_id}")
 def delete_hazard(hazard_id: int, authorization: Optional[str] = Header(default=None)):
     principal = require_admin(authorization)
-    report_filter, report_params = report_scope(
-        principal,
-        "latitude" if MYSQL_ENABLED else "lat",
-        "longitude" if MYSQL_ENABLED else "lng",
-    )
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute(
-                    f"DELETE FROM disaster_reports WHERE report_id=%s AND {report_filter}",
-                    (hazard_id, *report_params),
-                )
-                if cursor.rowcount == 0:
-                    raise HTTPException(404, "Incident report not found.")
-        return {"deleted": True, "id": str(hazard_id)}
-
-    with db() as con:
+    scope, params = report_scope(principal)
+    with pg_db() as con:
         cur = con.execute(
-            f"DELETE FROM hazards WHERE id=? AND {report_filter}",
-            (hazard_id, *report_params),
+            f"DELETE FROM disaster_reports WHERE report_id=%s AND {scope}",
+            (hazard_id, *params),
         )
-    if cur.rowcount == 0:
-        raise HTTPException(404, "Hazard report not found.")
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Incident report not found.")
     return {"deleted": True, "id": str(hazard_id)}
 
 @app.post("/api/admin/sos/clear")
 def clear_sos(authorization: Optional[str] = Header(default=None)):
     principal = require_admin(authorization)
-    sos_filter, sos_params = report_scope(
-        principal,
-        "latitude" if MYSQL_ENABLED else "lat",
-        "longitude" if MYSQL_ENABLED else "lng",
-    )
-    if MYSQL_ENABLED:
-        with mysql_db() as con:
-            with con.cursor() as cursor:
-                cursor.execute(
-                    f"UPDATE sos_alerts SET status='resolved' WHERE status='active' AND {sos_filter}",
-                    sos_params,
-                )
-        return {"active": False}
-
-    with db() as con:
+    scope, params = report_scope(principal)
+    with pg_db() as con:
         con.execute(
-            f"UPDATE sos_signals SET active=0 WHERE active=1 AND {sos_filter}",
-            sos_params,
+            f"UPDATE sos_alerts SET status='resolved' WHERE status='active' AND {scope}",
+            params,
         )
     return {"active": False}
 
