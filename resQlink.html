@@ -81,13 +81,13 @@ const fields = { users: ['name','organization','organization_name'], centers: ['
 const columns = {
   users: ['id', 'name', 'organization_label', 'active', 'created_at'],
   reports: ['id', 'incident_type', 'description', 'photo', 'lat', 'lng', 'status', 'created_at'],
-  sos: ['id', 'status', 'created_at'],
+    sos: ['id', 'status', 'lat', 'lng', 'created_at'],
   centers: ['id', 'name', 'address', 'latitude', 'longitude', 'capacity', 'occupancy', 'status'],
   announcements: ['id', 'title', 'message', 'level', 'audience', 'created_at'],
   services: ['id', 'title', 'category', 'status', 'updated_at'],
   faqs: ['id', 'question', 'category', 'status', 'updated_at'],
 };
-let current = 'dashboard', page = 1, editing = null, rows = [], refreshTimer = null;
+let current = 'dashboard', page = 1, editing = null, rows = [], refreshTimer = null, sosTimer = null, sosPick = null, lastSosId, reportType = '';
 const $ = s => document.querySelector(s), esc = x => String(x ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const pretty = s => String(s).replaceAll('_', ' ').replace(/\b\w/g, c => c.toUpperCase());
 function toast(s) { $('#toast').textContent = s; $('#toast').style.display = 'block'; setTimeout(() => $('#toast').style.display = 'none', 3000); }
@@ -104,6 +104,12 @@ function showApp(user) {
   refreshTimer = setInterval(() => {
     if (!document.hidden && (current === 'dashboard' || current === 'reports')) load();
   }, 30000);
+  clearInterval(sosTimer);
+    sosTimer = setInterval(() => {
+    if (document.hidden) return;
+    if (current === 'sos') load();
+    checkNewSos();
+  }, 3000);
 }
 function navigate(id) {
   current = id; page = 1; $('#search').value = '';
@@ -192,6 +198,61 @@ function renderIncidentMap(reports) {
   selector.value = '0';
   showReportLocation(0);
 }
+
+function sosTime(t) {
+  const d = new Date(String(t).replace(' ', 'T'));
+  return isNaN(d) ? String(t) : d.toLocaleString();
+}
+function showSosOnMap(r) {
+  const frame = $('#sosMapFrame');
+  if (!frame || !r) return;
+  const query = `${r.lat},${r.lng}`;
+  if (frame.dataset.q !== query) { frame.src = googleMapEmbedUrl(query, 17); frame.dataset.q = query; }
+  $('#sosOpenMap').href = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}`;
+  $('#sosMapStatus').textContent = `SOS #${r.id} (${r.status}) at ${Number(r.lat).toFixed(5)}, ${Number(r.lng).toFixed(5)} · sent ${sosTime(r.created_at)}`;
+}
+function renderSosMap(list) {
+  const sel = $('#sosSelect');
+  if (!sel) return;
+  const located = list.filter(r => Number.isFinite(r.lat) && Number.isFinite(r.lng));
+  if (!located.length) {
+    sel.innerHTML = '<option>No SOS alerts yet</option>';
+    sel.disabled = true;
+    $('#sosMapStatus').textContent = 'No SOS alerts yet. Showing Bacoor, Cavite.';
+    return;
+  }
+  sel.disabled = false;
+  const sig = located.map(r => r.id + r.status).join();
+  if (sel.dataset.sig !== sig) {
+    sel.innerHTML = located.map(r => `<option value="${r.id}">#${r.id} · ${esc(r.status)} · ${esc(sosTime(r.created_at))}</option>`).join('');
+    sel.dataset.sig = sig;
+  }
+  const chosen = located.find(r => String(r.id) === String(sosPick)) || located[0];
+  sel.value = String(chosen.id);
+  showSosOnMap(chosen);
+  sel.onchange = () => { sosPick = sel.value; showSosOnMap(located.find(r => String(r.id) === sel.value)); };
+}
+async function checkNewSos() {
+  try {
+    const d = await api('/api/sos?page=1');
+    const latest = (d.rows || []).find(r => r.status === 'active');
+    const id = latest ? latest.id : null;
+    if (lastSosId !== undefined && id && id > (lastSosId || 0)) {
+      sosPick = null;
+      toast('🆘 New SOS alert received');
+      if (current === 'dashboard') load();
+    }
+    lastSosId = id;
+  } catch (e) {}
+}
+
+const analyticsStat = (n, label) => `<section class="panel" style="text-align:center"><div style="font-size:32px;font-weight:700">${n}</div><div class="muted">${label}</div></section>`;
+function analyticsBars(title, items) {
+  const max = Math.max(1, ...items.map(i => i.total));
+  const body = items.length ? items.map(i => `<div style="margin:10px 0"><div style="display:flex;justify-content:space-between;font-size:14px"><span>${esc(pretty(i.label))}</span><b>${i.total}</b></div><div style="background:#e8eef8;border-radius:6px;height:10px"><div style="width:${Math.round(i.total / max * 100)}%;height:10px;border-radius:6px;background:#2563eb"></div></div></div>`).join('') : '<p class="muted">No data yet.</p>';
+  return `<section class="panel"><h3>${title}</h3>${body}</section>`;
+}
+
 async function load() {
   try {
     if (current === 'dashboard') {
@@ -203,18 +264,34 @@ async function load() {
         ['green','✓',s.verifiedReports,'Verified Reports','Confirmed incidents'],
         ['blue','⌂',s.totalReports,'Total Reports','All community reports']
       ].map(x => `<div class="card ${x[0]}"><div class="symbol">${x[1]}</div><div class="metric">${x[2]}</div><div class="label">${x[3]}</div><div class="hint">${x[4]}</div></div>`).join('')}</div><div class="panels"><section class="panel"><h3>Incident Map Preview</h3>${map()}</section><section class="panel"><h3>Recent Disaster Reports</h3>${table((d.hazards || []).map(reportRow).slice(0,5),['id','incident_type','status'],false)}<br><h3>Active SOS</h3>${table(d.activeSos ? [{id:d.activeSos.id,status:'active'}] : [],['id','status'],false)}</section></div>`;
-      renderIncidentMap(d.hazards || []);
+       let sosPins = [];
+      try {
+        const sd = await api('/api/sos?page=1');
+        sosPins = (sd.rows || []).filter(r => r.status !== 'resolved').map(r => ({
+          id: `SOS-${r.id}`, type: '🆘 SOS alert', status: r.status, lat: r.lat, lng: r.lng,
+        }));
+        sosPins.sort((a, b) => (b.status === 'active') - (a.status === 'active'));
+      } catch (e) {}
+      renderIncidentMap([...sosPins, ...(d.hazards || [])]);
       return;
     }
-    if (current === 'reports') {
+      if (current === 'reports') {
       const d = await api('/api/admin/overview');
       const query = $('#search').value.trim().toLowerCase();
-      rows = (d.hazards || []).map(reportRow).filter(r =>
-        !query || [r.id, r.incident_type, r.description, r.status].some(v => String(v ?? '').toLowerCase().includes(query))
+      const all = (d.hazards || []).map(reportRow);
+      const keyOf = v => String(v ?? '').trim().toLowerCase();
+      const typeMap = new Map();
+      all.forEach(r => { const k = keyOf(r.incident_type); if (k && !typeMap.has(k)) typeMap.set(k, r.incident_type); });
+      if (reportType && !typeMap.has(reportType)) reportType = '';
+      rows = all.filter(r =>
+        (!reportType || keyOf(r.incident_type) === reportType) &&
+        (!query || [r.id, r.incident_type, r.description, r.status].some(v => String(v ?? '').toLowerCase().includes(query)))
       );
       const total = rows.length;
       const visibleRows = rows.slice((page - 1) * 20, page * 20);
-      $('#mainContent').innerHTML = `<section class="panel"><div class="toolbar"><b>${total} records</b><span class="muted">Page ${page} • 20 records per page</span></div>${table(visibleRows, columns.reports)}<div class="pagination"><button class="outline" id="prev" ${page === 1 ? 'disabled' : ''}>← Previous</button><button class="outline" id="next" ${!total || page * 20 >= total ? 'disabled' : ''}>Next →</button></div></section>`;
+      const typeOptions = [...typeMap].map(([k, label]) => `<option value="${esc(k)}" ${k === reportType ? 'selected' : ''}>${esc(label)}</option>`).join('');
+      $('#mainContent').innerHTML = `<section class="panel"><div class="toolbar"><b>${total} records</b><label style="display:flex;align-items:center;gap:8px">Incident type: <select id="typeFilter"><option value="">All types</option>${typeOptions}</select></label><span class="muted">Page ${page} • 20 records per page</span></div>${table(visibleRows, columns.reports)}<div class="pagination"><button class="outline" id="prev" ${page === 1 ? 'disabled' : ''}>← Previous</button><button class="outline" id="next" ${!total || page * 20 >= total ? 'disabled' : ''}>Next →</button></div></section>`;
+      $('#typeFilter').onchange = e => { reportType = e.target.value; page = 1; load(); };
       $('#prev').onclick = () => { page--; load(); };
       $('#next').onclick = () => { page++; load(); };
       return;
@@ -238,8 +315,9 @@ async function load() {
       $('#next').onclick = () => { page++; load(); };
       return;
     }
-    if (current === 'analytics') {
-      $('#mainContent').innerHTML = `<section class="panel"><h3>System Analytics & Statistics</h3><p>Analytics data will load from database.</p></section>`;
+        if (current === 'analytics') {
+      const a = await api('/api/analytics');
+      $('#mainContent').innerHTML = `<div style="display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr))">${analyticsStat(a.totals.reports, 'Total reports')}${analyticsStat(a.totals.sos, 'SOS alerts')}${analyticsStat(a.totals.activeSos, 'Active SOS')}${analyticsStat(a.chatMessages, 'Chatbot messages')}</div><div style="display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));margin-top:16px">${analyticsBars('Reports by type', a.reportsByType)}${analyticsBars('Reports by status', a.reportsByStatus)}${analyticsBars('Reports in the last 7 days', a.reportsPerDay)}${analyticsBars('SOS alerts by status', a.sosByStatus)}</div>`;
       return;
     }
     if (current === 'settings') {
@@ -247,6 +325,21 @@ async function load() {
       $('#settingsForm').onsubmit = e => { e.preventDefault(); toast('Settings saved successfully!'); };
       return;
     }
+
+        if (current === 'sos') {
+      const q = new URLSearchParams({ page, search: $('#search').value });
+      const d = await api(`/api/sos?${q}`);
+      rows = d.rows || [];
+      if (!$('#sosMapFrame')) {
+        $('#mainContent').innerHTML = `<section class="panel"><h3>SOS Location Map</h3><div class="map-controls"><label for="sosSelect">SOS alert:</label><select id="sosSelect"></select><a id="sosOpenMap" class="outline" href="#" target="_blank" rel="noopener noreferrer">Open in Google Maps</a></div><div class="map"><iframe id="sosMapFrame" title="Map showing the SOS location" src="${esc(googleMapEmbedUrl('Bacoor, Cavite', 12))}" style="width:100%;height:100%;border:0;border-radius:8px;display:block" referrerpolicy="no-referrer-when-downgrade" allowfullscreen></iframe></div><div id="sosMapStatus" class="map-status" role="status"></div></section><section class="panel" id="sosTablePanel"></section>`;
+      }
+      renderSosMap(rows);
+      $('#sosTablePanel').innerHTML = `<div class="toolbar"><b>${d.total || 0} records</b><span class="muted">Page ${d.page || 1} • 20 records per page</span></div>${table(rows, columns.sos)}<div class="pagination"><button class="outline" id="prev" ${page === 1 ? 'disabled' : ''}>← Previous</button><button class="outline" id="next" ${!d.total || page * 20 >= d.total ? 'disabled' : ''}>Next →</button></div>`;
+      $('#prev').onclick = () => { page--; load(); };
+      $('#next').onclick = () => { page++; load(); };
+      return;
+    }
+
     const q = new URLSearchParams({ page, search: $('#search').value });
     const d = await api(`/api/${current}?${q}`);
     rows = d.rows || [];
@@ -400,7 +493,7 @@ $('#loginForm').onsubmit = async e => {
     $('#loginError').textContent = err.message;
   }
 };
-$('#logout').onclick = () => { clearInterval(refreshTimer); adminToken = ''; $('#adminToken').value = ''; showLogin(); };
+$('#logout').onclick = () => { clearInterval(refreshTimer); clearInterval(sosTimer); adminToken = ''; $('#adminToken').value = ''; showLogin(); };
 </script>
 </body>
 </html>

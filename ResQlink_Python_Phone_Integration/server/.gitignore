@@ -1,6 +1,10 @@
 .env
 .venv/
+venv/
 __pycache__/
 *.py[cod]
 resqlink.db
 uploads/
+.vscode/
+node_modules/
+archives/

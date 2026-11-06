@@ -21,7 +21,7 @@ import {
   View,
 } from 'react-native';
 
-const API_BASE = 'http://10.245.206.88:8001';
+const API_BASE = 'https://highland-highest-bundle-diagnosis.trycloudflare.com';
 const OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
 const PHOTON_URL = 'https://photon.komoot.io/api/';
 const OSRM_URL = 'https://router.project-osrm.org';
@@ -362,6 +362,19 @@ function buildBotReply(message) {
   return '🤖 I am standing by to assist. Ask me about fire safety, evacuation centers, first aid, or emergency contacts.';
 }
 
+const INCIDENT_TYPES = [
+  'Fire',
+  'Flash flood',
+  'Flooding',
+  'Earthquake',
+  'Road accident',
+  'Typhoon',
+  'Landslide',
+  'Medical emergency',
+  'Power outage',
+  'Other',
+];
+
 export default function App() {
   const [authMode, setAuthMode] = useState('login');
   const [currentUser, setCurrentUser] = useState(null);
@@ -391,6 +404,8 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [type, setType] = useState('Flooding');
+  const [typeOpen, setTypeOpen] = useState(false);
+  const [typeOther, setTypeOther] = useState(false);
   const [description, setDescription] = useState('Street is flooding near the main highway and vehicles are struggling to pass.');
   const [status, setStatus] = useState('Connecting to backend...');
   const [activeTab, setActiveTab] = useState('home');
@@ -739,6 +754,26 @@ export default function App() {
       label: 'Live SOS from ResQLink mobile app',
     }),
   });
+
+    const sendInstantSos = async () => {
+    let coords = location;
+    try {
+      const fresh = await Promise.race([
+        Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('gps timeout')), 4000)),
+      ]);
+      coords = fresh.coords;
+      setLocation(fresh.coords);
+    } catch {}
+    if (!coords) coords = await locateMe();
+    if (!coords) return;
+    try {
+      await postSosLocation(coords);
+      Alert.alert('SOS sent', 'Responders have received your location.');
+    } catch (err) {
+      Alert.alert('SOS not sent', `${err?.message || err}\n\nServer: ${API_BASE}`);
+    }
+  };
 
   const toggleLiveSos = async () => {
     if (sosActive) {
@@ -1139,13 +1174,13 @@ export default function App() {
             <View style={styles.avatar}><Text style={styles.avatarText}>{currentUser?.name?.charAt(0) || 'G'}</Text></View>
           </View>
 
-          <Text style={styles.fireTitle}>{'Need emergency fire\nservice?'}</Text>
+          <Text style={styles.fireTitle}>{'Need SOS Emergency\nservice?'}</Text>
 
           <View style={styles.fireButtonWrap}>
             <View style={styles.fireRing}>
-              <TouchableOpacity style={styles.fireButton} onPress={openFireReport}>
-                <Text style={styles.fireIcon}>🔥</Text>
-                <Text style={styles.fireButtonText}>Report fire</Text>
+              <TouchableOpacity style={styles.fireButton} onPress={sendInstantSos}>
+                <Text style={styles.fireIcon}>🚨</Text>
+                <Text style={styles.fireButtonText}>SOS Button</Text>
               </TouchableOpacity>
             </View>
             <Text style={styles.orText}>or</Text>
@@ -1160,15 +1195,42 @@ export default function App() {
         <ScrollView style={styles.screen} contentContainerStyle={styles.reportScreen}>
           <Text style={styles.reportHeading}>Report an incident</Text>
 
-          <View style={styles.fieldWrapReport}>
+                    <View style={styles.fieldWrapReport}>
             <Text style={styles.fieldLabel}>Incident type</Text>
-            <TextInput
-              style={styles.fieldInput}
-              value={type}
-              onChangeText={setType}
-              placeholder="e.g. Flood, fire, road hazard"
-              maxLength={80}
-            />
+            <TouchableOpacity style={styles.typeSelect} onPress={() => setTypeOpen(!typeOpen)}>
+              <Text style={styles.typeSelectText}>
+                {typeOther ? 'Other' : type || 'Select incident type'}
+              </Text>
+              <Text style={styles.typeArrow}>{typeOpen ? '▲' : '▼'}</Text>
+            </TouchableOpacity>
+            {typeOpen && (
+              <View style={styles.typeMenu}>
+                {INCIDENT_TYPES.map((item) => (
+                  <TouchableOpacity
+                    key={item}
+                    style={styles.typeOption}
+                    onPress={() => {
+                      setTypeOpen(false);
+                      if (item === 'Other') { setTypeOther(true); setType(''); }
+                      else { setTypeOther(false); setType(item); }
+                    }}
+                  >
+                    <Text style={[styles.typeOptionText, (typeOther ? item === 'Other' : item === type) && styles.typeOptionActive]}>
+                      {item}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            )}
+            {typeOther && (
+              <TextInput
+                style={[styles.fieldInput, { marginTop: 8 }]}
+                value={type}
+                onChangeText={setType}
+                placeholder="Type the incident"
+                maxLength={80}
+              />
+            )}
           </View>
 
           <View style={styles.fieldWrapReport}>
@@ -1747,6 +1809,35 @@ const styles = StyleSheet.create({
   fieldWrapReport: {
     marginBottom: 14,
   },
+    typeSelect: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    borderRadius: 10,
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+  },
+  typeSelectText: { fontSize: 14, color: '#1f2937' },
+  typeArrow: { fontSize: 12, color: '#6b7280' },
+  typeMenu: {
+    marginTop: 6,
+    borderRadius: 10,
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    overflow: 'hidden',
+  },
+  typeOption: {
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f3f4f6',
+  },
+  typeOptionText: { fontSize: 14, color: '#1f2937' },
+  typeOptionActive: { color: '#ef4444', fontWeight: '700' },
   fieldLabel: {
     fontSize: 13,
     color: '#1f2937',

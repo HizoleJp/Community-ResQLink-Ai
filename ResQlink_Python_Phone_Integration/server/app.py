@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 import base64
 import binascii
+import difflib
 from contextlib import contextmanager
 import hashlib
 import hmac
@@ -890,6 +891,47 @@ def stop_sos():
     log_event("SOS stopped")
     return {"active": False}
 
+class SosStatusUpdate(BaseModel):
+    status: str = Field(pattern="^(active|responding|resolved)$")
+
+@app.get("/api/sos")
+def list_sos(page: int = 1, search: str = "", authorization: Optional[str] = Header(default=None)):
+    principal = require_admin(authorization)
+    scope, params = report_scope(principal)
+    page = max(page, 1)
+    where, args = scope, list(params)
+    if search.strip():
+        where += " AND (status ILIKE %s OR CAST(sos_id AS TEXT) = %s)"
+        args += [f"%{search.strip()}%", search.strip()]
+    with pg_db() as con:
+        total = con.execute(f"SELECT COUNT(*) AS total FROM sos_alerts WHERE {where}", args).fetchone()["total"]
+        rows = con.execute(
+            f"SELECT * FROM sos_alerts WHERE {where} ORDER BY created_at DESC LIMIT 20 OFFSET %s",
+            [*args, (page - 1) * 20],
+        ).fetchall()
+    return {
+        "total": total,
+        "page": page,
+        "rows": [{
+            "id": r["sos_id"], "status": r["status"],
+            "lat": float(r["latitude"]), "lng": float(r["longitude"]),
+            "created_at": str(r["created_at"]),
+        } for r in rows],
+    }
+
+@app.patch("/api/sos/{sos_id}")
+def update_sos(sos_id: int, payload: SosStatusUpdate, authorization: Optional[str] = Header(default=None)):
+    principal = require_admin(authorization)
+    scope, params = report_scope(principal)
+    with pg_db() as con:
+        cur = con.execute(
+            f"UPDATE sos_alerts SET status=%s WHERE sos_id=%s AND {scope}",
+            (payload.status, sos_id, *params),
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(404, "SOS alert not found.")
+    return {"ok": True}
+
 class ChatTurn(BaseModel):
     role: str = Field(pattern="^(user|bot)$")
     text: str = Field(max_length=1000)
@@ -901,27 +943,162 @@ class ChatPayload(BaseModel):
     lng: Optional[float] = None
     centers: list[str] = Field(default_factory=list, max_length=5)
 
+class FaqPayload(BaseModel):
+    question: str = Field(min_length=1, max_length=300)
+    answer: str = Field(min_length=1, max_length=2000)
+    category: str = Field(default="General", max_length=60)
+    status: str = Field(default="active", pattern="^(active|inactive)$")
+
+class FaqUpdate(BaseModel):
+    question: Optional[str] = Field(default=None, min_length=1, max_length=300)
+    answer: Optional[str] = Field(default=None, min_length=1, max_length=2000)
+    category: Optional[str] = Field(default=None, max_length=60)
+    status: Optional[str] = Field(default=None, pattern="^(active|inactive)$")
+
+def ensure_faq_table(con):
+    con.execute("""CREATE TABLE IF NOT EXISTS chatbot_faqs(
+        id SERIAL PRIMARY KEY,
+        question TEXT NOT NULL,
+        answer TEXT NOT NULL,
+        category VARCHAR(60) NOT NULL DEFAULT 'General',
+        status VARCHAR(20) NOT NULL DEFAULT 'active',
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+
+def faq_json(r):
+    return {
+        "id": r["id"], "question": r["question"], "answer": r["answer"],
+        "category": r["category"], "status": r["status"],
+        "updated_at": str(r["updated_at"])[:19],
+    }
+
+def match_faq(message: str):
+    # Returns the answer of an active FAQ that matches the message, or None.
+    try:
+        with pg_db() as con:
+            ensure_faq_table(con)
+            rows = con.execute("SELECT question, answer FROM chatbot_faqs WHERE status='active'").fetchall()
+    except Exception:
+        return None
+    text = message.strip().lower()
+    best, best_score = None, 0.0
+    for r in rows:
+        q = r["question"].strip().lower()
+        score = 1.0 if q and q in text else difflib.SequenceMatcher(None, text, q).ratio()
+        if score > best_score:
+            best, best_score = r["answer"], score
+    return best if best_score >= 0.75 else None
+
+@app.get("/api/faqs")
+def list_faqs(page: int = 1, search: str = "", authorization: Optional[str] = Header(default=None)):
+    require_admin(authorization)
+    page = max(page, 1)
+    where, args = "1=1", []
+    if search.strip():
+        where = "(question ILIKE %s OR answer ILIKE %s OR category ILIKE %s)"
+        args = [f"%{search.strip()}%"] * 3
+    with pg_db() as con:
+        ensure_faq_table(con)
+        total = con.execute(f"SELECT COUNT(*) AS total FROM chatbot_faqs WHERE {where}", args).fetchone()["total"]
+        rows = con.execute(
+            f"SELECT * FROM chatbot_faqs WHERE {where} ORDER BY updated_at DESC LIMIT 20 OFFSET %s",
+            [*args, (page - 1) * 20],
+        ).fetchall()
+    return {"total": total, "page": page, "rows": [faq_json(r) for r in rows]}
+
+@app.post("/api/faqs", status_code=201)
+def create_faq(payload: FaqPayload, authorization: Optional[str] = Header(default=None)):
+    require_admin(authorization)
+    with pg_db() as con:
+        ensure_faq_table(con)
+        row = con.execute(
+            "INSERT INTO chatbot_faqs(question,answer,category,status) VALUES(%s,%s,%s,%s) RETURNING *",
+            (payload.question.strip(), payload.answer.strip(), payload.category.strip() or "General", payload.status),
+        ).fetchone()
+    return {"item": faq_json(row)}
+
+@app.patch("/api/faqs/{faq_id}")
+def update_faq(faq_id: int, payload: FaqUpdate, authorization: Optional[str] = Header(default=None)):
+    require_admin(authorization)
+    changes = {k: (v.strip() if isinstance(v, str) else v) for k, v in payload.model_dump(exclude_none=True).items()}
+    if not changes:
+        raise HTTPException(400, "Nothing to update.")
+    sets = ", ".join(f"{k}=%s" for k in changes)  # keys come from the model above, not from the user
+    with pg_db() as con:
+        ensure_faq_table(con)
+        cur = con.execute(
+            f"UPDATE chatbot_faqs SET {sets}, updated_at=NOW() WHERE id=%s",
+            (*changes.values(), faq_id),
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(404, "FAQ not found.")
+    return {"ok": True}
+
+@app.delete("/api/faqs/{faq_id}")
+def delete_faq(faq_id: int, authorization: Optional[str] = Header(default=None)):
+    require_admin(authorization)
+    with pg_db() as con:
+        ensure_faq_table(con)
+        cur = con.execute("DELETE FROM chatbot_faqs WHERE id=%s", (faq_id,))
+        if cur.rowcount == 0:
+            raise HTTPException(404, "FAQ not found.")
+    return {"ok": True}
+
+@app.get("/api/analytics")
+def analytics(authorization: Optional[str] = Header(default=None)):
+    principal = require_admin(authorization)
+    scope, params = report_scope(principal)
+    with pg_db() as con:
+        by_type = con.execute(
+            f"SELECT hazard_type AS label, COUNT(*) AS total FROM disaster_reports WHERE {scope} "
+            "GROUP BY hazard_type ORDER BY total DESC LIMIT 8", params).fetchall()
+        by_status = con.execute(
+            f"SELECT status AS label, COUNT(*) AS total FROM disaster_reports WHERE {scope} "
+            "GROUP BY status ORDER BY total DESC", params).fetchall()
+        per_day = con.execute(
+            f"SELECT created_at::date AS day, COUNT(*) AS total FROM disaster_reports "
+            f"WHERE {scope} AND created_at >= NOW() - INTERVAL '7 days' GROUP BY day ORDER BY day", params).fetchall()
+        sos_status = con.execute(
+            f"SELECT status AS label, COUNT(*) AS total FROM sos_alerts WHERE {scope} "
+            "GROUP BY status ORDER BY total DESC", params).fetchall()
+        chats = con.execute("SELECT COUNT(*) AS total FROM chat_logs").fetchone()["total"]
+    pack = lambda rows: [{"label": str(r["label"]), "total": r["total"]} for r in rows]
+    sos_list = pack(sos_status)
+    return {
+        "totals": {
+            "reports": sum(r["total"] for r in by_status),
+            "sos": sum(r["total"] for r in sos_status),
+            "activeSos": next((r["total"] for r in sos_list if r["label"] == "active"), 0),
+        },
+        "chatMessages": chats,
+        "reportsByType": pack(by_type),
+        "reportsByStatus": pack(by_status),
+        "reportsPerDay": [{"label": str(r["day"]), "total": r["total"]} for r in per_day],
+        "sosByStatus": sos_list,
+    }
+
 @app.post("/api/chat")
 def chat(payload: ChatPayload, request: Request):
     ip = request.client.host if request.client else "unknown"
     if rate_limited(ip):
-       raise HTTPException(429, "Too many chat messages. Wait a minute and try again.")
-    try:
-        reply = ask_gemini(
-           payload.message,
-           [t.model_dump() for t in payload.history],
-               payload.lat,
-               payload.lng,
-               payload.centers,
-        )
-    except Exception:
-       raise HTTPException(503, "The AI assistant is unavailable right now.")
+        raise HTTPException(429, "Too many chat messages. Wait a minute and try again.")
+    reply = match_faq(payload.message)
+    if not reply:
+        try:
+            reply = ask_gemini(
+                payload.message,
+                [t.model_dump() for t in payload.history],
+                payload.lat,
+                payload.lng,
+                payload.centers,
+            )
+        except Exception:
+            raise HTTPException(503, "The AI assistant is unavailable right now.")
     try:
         with pg_db() as con:
             con.execute(
-               "INSERT INTO chat_logs(user_query, bot_response) VALUES (%s, %s)",
-               (payload.message, reply),
-    )
+                "INSERT INTO chat_logs(user_query, bot_response) VALUES (%s, %s)",
+                (payload.message, reply),
+            )
     except Exception:
         pass  # logging must never break the chat
     return {"reply": reply}
